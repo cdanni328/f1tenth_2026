@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+Unified MCL Launch File
+Supports real hardware, simulation, and bag playback modes
+
+Usage:
+  Real car:      ros2 launch mcl_pkg mcl_launch.py mod:=real
+  Simulation:    ros2 launch mcl_pkg mcl_launch.py mod:=sim
+  Bag playback:  ros2 launch mcl_pkg mcl_launch.py mod:=bag
+
+  # To change map, launch with map_name:='your_map'
+  Example:       ros2 launch mcl_pkg mcl_launch.py mod:=real map_name:='my_custom_map'
+
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+import os
+import yaml
+
+
+def generate_launch_description():
+    # Get package share directory
+    from ament_index_python.packages import get_package_share_directory
+    pkg_share = FindPackageShare('mcl_pkg')
+
+    # === LAUNCH ARGUMENTS ===
+    mode_arg = DeclareLaunchArgument(
+        'mod',
+        default_value='real',
+        description='Launch mode: real (real car using /odom), sim (simulation, use sim time, /ego_racecar/odom), bag (bag file play, use sim time, /odom)'
+    )
+
+    # Read default map name from source config file
+    default_map_name = 'sibal1'  # Fallback default
+    try:
+        # Always read from source config
+        source_config = os.path.abspath(os.path.join(
+            get_package_share_directory('mcl_pkg'),
+            '..', '..', '..', '..', 'src', 'perception_ws', 'monte_carlo_localization', 'config', 'mcl_config.yaml'
+        ))
+        if os.path.exists(source_config):
+            with open(source_config, 'r') as f:
+                config_data = yaml.safe_load(f)
+                if 'map_server' in config_data and 'ros__parameters' in config_data['map_server']:
+                    map_param = config_data['map_server']['ros__parameters'].get('map')
+                    if map_param:
+                        default_map_name = map_param
+                        print(f"[MCL Launch] Using map from config: {default_map_name}")
+    except Exception as e:
+        print(f"[MCL Launch] Warning: Could not read map from config file: {e}")
+
+    map_name_arg = DeclareLaunchArgument(
+        'map_name',
+        default_value=default_map_name,
+        description='Map name (without .yaml extension)'
+    )
+
+    use_rviz_arg = DeclareLaunchArgument(
+        'use_rviz',
+        default_value='true',
+        description='Launch RViz visualization'
+    )
+
+
+    # === CONFIGURATION ===
+    # Try to find source config first, fallback to install config
+    install_config_file = os.path.join(
+        get_package_share_directory('mcl_pkg'),
+        'config',
+        'mcl_config.yaml'
+    )
+
+    # Look for source config relative to install directory
+    install_dir = get_package_share_directory('mcl_pkg')
+    potential_source_config = os.path.join(install_dir, '..', '..', '..', '..', 'src', 'perception_ws', 'monte_carlo_localization', 'config', 'mcl_config.yaml')
+    potential_source_config = os.path.abspath(potential_source_config)
+
+    # Use source config if it exists, otherwise use install config
+    if os.path.exists(potential_source_config):
+        default_config_file = potential_source_config
+        print(f"[MCL Launch] Using SOURCE config: {default_config_file}")
+    else:
+        default_config_file = install_config_file
+        print(f"[MCL Launch] Using INSTALL config: {default_config_file}")
+
+    config_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=default_config_file,
+        description='Path to MCL configuration file'
+    )
+    # NOTE: map_name + '.yaml' is concatenated via PythonExpression instead of a
+    # nested list, since PathJoinSubstitution's nested-list concatenation form is
+    # not reliably supported across launch package versions.
+    map_file_name = PythonExpression([
+        "'", LaunchConfiguration('map_name'), "' + '.yaml'"
+    ])
+    map_file_path = PathJoinSubstitution([pkg_share, 'maps', map_file_name])
+
+    # === DYNAMIC PARAMETERS BASED ON MODE ===
+    dynamic_params = {
+        # Topic names
+        'scan_topic': '/scan',  # All modes use /scan
+        'odom_topic': PythonExpression([
+            "'/ego_racecar/odom' if '", LaunchConfiguration('mod'), "' == 'sim' else '/odom'"
+        ]),
+
+        # TF frame names
+        'map_frame': PythonExpression([
+            "'mcl_map' if '", LaunchConfiguration('mod'), "' == 'sim' else 'map'"
+        ]),
+        'odom_frame': PythonExpression([
+            "'map' if '", LaunchConfiguration('mod'), "' == 'sim' else 'odom'"
+        ]),
+        'base_frame': PythonExpression([
+            "'ego_racecar/base_link' if '", LaunchConfiguration('mod'), "' == 'sim' else 'base_link'"
+        ]),
+        'laser_frame': PythonExpression([
+            "'ego_racecar/laser' if '", LaunchConfiguration('mod'), "' == 'sim' else 'laser'"
+        ]),
+
+        # TF publishing control
+        # Simulation: MCL publishes mcl_map->map (for visualization/comparison)
+        # Real robot: MCL publishes map->odom (odom stack handles odom->base_link)
+        'publish_map_odom_tf': True  # Always publish for visualization
+
+    }
+
+    # === COMMON PARAMETERS ===
+    common_params = {
+        'use_sim_time': PythonExpression([
+            "'true' if '", LaunchConfiguration('mod'), "' in ['sim', 'bag'] else 'false'"
+        ])
+    }
+
+    # === MAP SERVER NODE ===
+    map_server_node = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='particle_filter_map_server',
+        output='screen',
+        parameters=[
+            common_params,
+            {'yaml_filename': map_file_path}
+        ]
+    )
+
+    # === LIFECYCLE MANAGER ===
+    lifecycle_manager_node = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_particle_filter',
+        output='screen',
+        parameters=[
+            common_params,
+            {
+                'autostart': True,
+                'node_names': ['particle_filter_map_server']
+            }
+        ]
+    )
+
+    # === MCL NODE ===
+    mcl_node = TimerAction(
+        period=3.0,  # Allow map server and simulator to initialize
+        actions=[
+            Node(
+                package='mcl_pkg',
+                executable='mcl_node',
+                name='mcl',
+                output='screen',
+                parameters=[
+                    LaunchConfiguration('config_file'),
+                    common_params,
+                    dynamic_params
+                ],
+                remappings=[
+                    ('/map_server/map', '/particle_filter_map_server/map')
+                ]
+            )
+        ]
+    )
+
+    # === TF TRANSFORMS RESPONSIBILITY ===
+    # Real mode: F1Tenth stack provides base_link->laser, MCL provides map->odom->base_link
+    # Sim mode:  Simulator provides map->base_link->laser, MCL only does localization
+
+    # === RVIZ NODE ===
+    rviz_config = PathJoinSubstitution([pkg_share, 'rviz', 'mcl.rviz'])
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', rviz_config],
+        condition=IfCondition(LaunchConfiguration('use_rviz')),
+        output='screen',
+        parameters=[
+            common_params,
+            {
+                'transform_timeout': 300.0,
+                'message_filter_queue_size': 100,
+                'tf_buffer_cache_time_s': 300.0,
+                'tf_tolerance': 300.0
+            }
+        ]
+    )
+
+    return LaunchDescription([
+        # Launch arguments
+        mode_arg,
+        map_name_arg,
+        use_rviz_arg,
+        config_arg,
+
+        # Nodes
+        map_server_node,
+        lifecycle_manager_node,
+        mcl_node,
+        rviz_node,
+    ])
+
